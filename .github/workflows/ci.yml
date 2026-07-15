@@ -1,0 +1,311 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, dev, auth]
+  pull_request:
+    branches: [main, master, dev, auth]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref so rapid pushes don't pile up.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: jobs only read the repo unless explicitly granted more.
+permissions:
+  contents: read
+
+# Kill switch (GitHub Actions repository VARIABLE — not a Secret, not local .env):
+#   Settings → Secrets and variables → Actions → Variables tab (not Secrets)
+#   Name: CI_ENABLED
+#   Value: false
+#   Wrong: Secrets tab, or Value = "CI_ENABLED = false"
+#   CI_ENABLED=false  → skip push/PR CI; "CI Success" stays green
+#   unset / other     → CI enabled (default)
+#   workflow_dispatch → always runs (manual "Run workflow")
+# Documented in README → CI → Disable CI.
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage 0 — Change detection
+  # ---------------------------------------------------------------------------
+  changes:
+    name: Stage 0 · Changed Paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ vars.CI_ENABLED != 'false' || github.event_name == 'workflow_dispatch' }}
+    outputs:
+      shared_full: ${{ steps.filter.outputs.shared_full }}
+      unit_core: ${{ steps.filter.outputs.unit_core }}
+      unit_services: ${{ steps.filter.outputs.unit_services }}
+      unit_auth_dto: ${{ steps.filter.outputs.unit_auth_dto }}
+      e2e_general: ${{ steps.filter.outputs.e2e_general }}
+      e2e_auth: ${{ steps.filter.outputs.e2e_auth }}
+      deps_changed: ${{ steps.filter.outputs.deps_changed }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Detect changed paths
+        id: filter
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            base_sha="${{ github.event.pull_request.base.sha }}"
+            head_sha="${{ github.event.pull_request.head.sha }}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            base_sha="${{ github.event.before }}"
+            head_sha="${{ github.sha }}"
+            if [[ "$base_sha" == "0000000000000000000000000000000000000000" ]]; then
+              base_sha="$(git rev-list --max-parents=0 "$head_sha" | tail -n 1)"
+            fi
+          else
+            base_sha="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+            head_sha="${{ github.sha }}"
+          fi
+
+          if ! git cat-file -e "$base_sha^{commit}" 2>/dev/null; then
+            git fetch --no-tags --prune --depth=200 origin "$base_sha"
+          fi
+
+          git diff --name-only "$base_sha" "$head_sha" > changed-files.txt
+          echo "Changed files from $base_sha to $head_sha:"
+          cat changed-files.txt || true
+
+          has_change() {
+            local pattern="$1"
+            grep -Eq "$pattern" changed-files.txt
+          }
+
+          write_output() {
+            local key="$1"
+            local pattern="$2"
+            if has_change "$pattern"; then
+              echo "$key=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$key=false" >> "$GITHUB_OUTPUT"
+            fi
+          }
+
+          write_output "shared_full" '^(\.github/|package\.json$|bun\.lock$|tsconfig.*\.json$|eslint\.config\.mjs$|\.prettier|nest-cli\.json$|prisma/)'
+          write_output "unit_core" '^(src/app/|src/middleware/|src/modules/|test/app/|test/middleware/)'
+          write_output "unit_services" '^(src/lib/prisma/|src/lib/redis/|src/lib/email/|src/lib/gravatar/|src/middleware/queue/|src/middleware/worker/|test/lib/|test/middleware/queue/|test/middleware/worker/)'
+          write_output "unit_auth_dto" '^(src/lib/betterauth/|src/modules/auth/|src/modules/user/|src/modules/organisation/|src/dto/|test/lib/betterauth/|test/dto/)'
+          write_output "e2e_general" '^(src/app/|src/middleware/|src/modules/|test/e2e/app\.e2e-spec\.ts$)'
+          write_output "e2e_auth" '^(src/lib/betterauth/|src/modules/auth/|src/modules/user/|src/modules/organisation/|src/dto/|test/e2e/auth|prisma/)'
+          write_output "deps_changed" '^(package\.json$|bun\.lock$|\.github/actions/setup/)'
+
+  # ---------------------------------------------------------------------------
+  # Stage 1 — Static quality checks (single install)
+  # ---------------------------------------------------------------------------
+  static-checks:
+    name: Stage 1 · Static Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: ${{ vars.CI_ENABLED != 'false' || github.event_name == 'workflow_dispatch' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+      - run: bun run format:check
+      - run: bun run lint
+      - run: bun run typecheck
+      - run: bun run build
+      - name: Verify build artifacts
+        run: |
+          test -f dist/src/main.js
+          test -f dist/src/middleware/worker/worker.js
+          test -f dist/src/lib/email/templates/auth-otp.hbs
+          test -f dist/src/lib/email/templates/partials/stripe-layout-open.hbs
+      - run: bun run check:betterauth-versions
+
+  dependency-audit:
+    name: Stage 1 · Dependency Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [changes]
+    if: >-
+      (vars.CI_ENABLED != 'false' || github.event_name == 'workflow_dispatch') &&
+      (
+        (github.event_name == 'push' && (github.ref_name == 'main' || github.ref_name == 'master')) ||
+        needs.changes.outputs.deps_changed == 'true'
+      )
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+      # Advisory: surface vulnerabilities without failing the pipeline on a
+      # transitive advisory. Flip `|| true` to a gate once the baseline is clean.
+      - name: Run dependency audit
+        run: bun audit --json > security-audit.json || true
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: security-audit
+          path: security-audit.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Stage 2 — Quality gate (join point for all static checks)
+  # ---------------------------------------------------------------------------
+  quality-gate:
+    name: Stage 2 · Quality Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [static-checks, dependency-audit]
+    if: >-
+      always() &&
+      (vars.CI_ENABLED != 'false' || github.event_name == 'workflow_dispatch') &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    steps:
+      - run: echo "Stage 1 static checks passed."
+
+  # ---------------------------------------------------------------------------
+  # Stage 3 — Tests (selective on PRs/non-trunk, full on main/master pushes)
+  # ---------------------------------------------------------------------------
+  test-unit-core:
+    name: Stage 3 · Unit (Core)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [changes, quality-gate]
+    if: ${{ always() && (vars.CI_ENABLED != 'false' || github.event_name == 'workflow_dispatch') && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (github.ref_name == 'main' || github.ref_name == 'master')) || needs.changes.outputs.unit_core == 'true' || needs.changes.outputs.shared_full == 'true') }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+      - run: bun run test:app
+      - run: bun run test:config
+      - run: bun run test:filters
+      - run: bun run test:health
+      - run: bun run test:platform
+
+  test-unit-services:
+    name: Stage 3 · Unit (Services)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [changes, quality-gate]
+    if: ${{ always() && (vars.CI_ENABLED != 'false' || github.event_name == 'workflow_dispatch') && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (github.ref_name == 'main' || github.ref_name == 'master')) || needs.changes.outputs.unit_services == 'true' || needs.changes.outputs.shared_full == 'true') }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+      - run: bun run test:redis
+      - run: bun run test:prisma
+      - run: bun run test:queue
+      - run: bun run test:email
+      - run: bun run test:worker
+      - run: bun run test:gravatar
+
+  test-unit-auth-dto:
+    name: Stage 3 · Unit (Auth/DTO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [changes, quality-gate]
+    if: ${{ always() && (vars.CI_ENABLED != 'false' || github.event_name == 'workflow_dispatch') && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (github.ref_name == 'main' || github.ref_name == 'master')) || needs.changes.outputs.unit_auth_dto == 'true' || needs.changes.outputs.shared_full == 'true') }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+      - run: bun run test:auth
+      - run: bun run test:dto
+
+  test-cov:
+    name: Stage 3 · Coverage Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [quality-gate]
+    if: ${{ always() && (vars.CI_ENABLED != 'false' || github.event_name == 'workflow_dispatch') && github.event_name == 'push' && (github.ref_name == 'main' || github.ref_name == 'master') }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+      - run: bun run test:cov
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: coverage
+          path: coverage/
+          if-no-files-found: ignore
+
+  test-e2e:
+    name: Stage 3 · E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [changes, quality-gate]
+    if: ${{ always() && (vars.CI_ENABLED != 'false' || github.event_name == 'workflow_dispatch') && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (github.ref_name == 'main' || github.ref_name == 'master')) || needs.changes.outputs.e2e_general == 'true' || needs.changes.outputs.shared_full == 'true') }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+      - run: bun run test:e2e
+
+  test-e2e-auth:
+    name: Stage 3 · Auth E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [changes, quality-gate]
+    if: ${{ always() && (vars.CI_ENABLED != 'false' || github.event_name == 'workflow_dispatch') && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (github.ref_name == 'main' || github.ref_name == 'master')) || needs.changes.outputs.e2e_auth == 'true' || needs.changes.outputs.shared_full == 'true') }}
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: penielvault_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U test -d penielvault_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      E2E_DATABASE_URL: postgresql://test:test@localhost:5432/penielvault_test
+      E2E_AUTH_INTEGRATION: 'true'
+      NODE_ENV: test
+      EMAIL_PROVIDER: test
+      PLATFORM_NAME: penielvault-test
+      PLATFORM_SUPPORT: noreply@test.local
+      BETTER_AUTH_SECRET: test-secret-minimum-32-characters-long
+      BETTER_AUTH_URL: http://localhost:3000
+      PRODUCTION_URL: http://localhost:3000
+      DEVELOPMENT_URL: http://localhost:3000
+      PLATFORM_URL: http://localhost:3000
+      CORS_ORIGINS: https://app.example.com
+      REDIS_URL: ''
+      BETTER_AUTH_RATE_LIMIT_WINDOW: '60'
+      BETTER_AUTH_RATE_LIMIT_MAX: '100'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+      - run: bun run test:e2e:auth
+
+  # ---------------------------------------------------------------------------
+  # Aggregate status — the single check to require in branch protection.
+  # ---------------------------------------------------------------------------
+  ci-success:
+    name: CI Success
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    needs:
+      - static-checks
+      - dependency-audit
+      - quality-gate
+      - test-unit-core
+      - test-unit-services
+      - test-unit-auth-dto
+      - test-cov
+      - test-e2e
+      - test-e2e-auth
+    steps:
+      - name: Report when CI is disabled
+        if: ${{ vars.CI_ENABLED == 'false' && github.event_name != 'workflow_dispatch' }}
+        run: |
+          echo "CI skipped: repository variable CI_ENABLED=false."
+          echo "Unset CI_ENABLED (or set it to anything other than false) to re-enable."
+          echo "Manual workflow_dispatch still runs even when CI_ENABLED=false."
+      - name: Fail if any dependency failed or was cancelled
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: |
+          echo "One or more required jobs did not succeed."
+          exit 1
+      - run: echo "All CI checks passed."

@@ -1,0 +1,9 @@
+export { V1Module } from './v1.modules';
+export { AuthModule } from './auth/auth.module';
+export { AuthService } from './auth/auth.service';
+export { UserModule } from './user/user.module';
+export { UserService } from './user/user.service';
+export { BackofficeModule } from './backoffice/backoffice.module';
+export { BackofficeService } from './backoffice/backoffice.service';
+export { OrganisationModule } from './organisation/organisation.module';
+export { OrganisationService } from './organisation/organisation.service';

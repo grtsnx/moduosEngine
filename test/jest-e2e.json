@@ -1,0 +1,27 @@
+{
+  "moduleFileExtensions": ["js", "json", "ts"],
+  "rootDir": "..",
+  "testEnvironment": "node",
+  "testRegex": "test/e2e/.*\\.e2e-spec\\.ts$",
+  "setupFiles": ["<rootDir>/test/e2e/setup-env.ts"],
+  "transform": {
+    "^.+\\.(t|j)s$": "ts-jest"
+  },
+  "moduleNameMapper": {
+    "^src/(.*)$": "<rootDir>/src/$1",
+    "^test/fixtures$": "<rootDir>/test/fixtures/index.ts",
+    "^test/fixtures/(.*)$": "<rootDir>/test/fixtures/$1",
+    "^generated/prisma/client$": "<rootDir>/test/mocks/prisma-client.mock.ts",
+    "^@thallesp/nestjs-better-auth$": "<rootDir>/test/mocks/nestjs-better-auth.mock.ts",
+    "^better-auth/api$": "<rootDir>/test/mocks/better-auth-api.mock.ts",
+    "^better-auth$": "<rootDir>/test/mocks/better-auth.mock.ts",
+    "^better-auth/adapters/prisma$": "<rootDir>/test/mocks/better-auth-prisma-adapter.mock.ts",
+    "^better-auth/plugins/admin$": "<rootDir>/test/mocks/better-auth-plugins.mock.ts",
+    "^better-auth/plugins/bearer$": "<rootDir>/test/mocks/better-auth-plugins.mock.ts",
+    "^better-auth/plugins$": "<rootDir>/test/mocks/better-auth-plugins.mock.ts",
+    "^better-auth/plugins/organization$": "<rootDir>/test/mocks/better-auth-plugins.mock.ts",
+    "^better-auth/plugins/two-factor$": "<rootDir>/test/mocks/better-auth-plugins.mock.ts",
+    "^@better-auth/passkey$": "<rootDir>/test/mocks/better-auth-passkey.mock.ts",
+    "^@better-auth/infra$": "<rootDir>/test/mocks/better-auth-infra.mock.ts"
+  }
+}
